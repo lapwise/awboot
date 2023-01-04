@@ -26,7 +26,7 @@
  *
  */
 
-#include "main.h"
+#include "common.h"
 #include "debug.h"
 #include "sunxi_sdhci.h"
 #include "sdmmc.h"

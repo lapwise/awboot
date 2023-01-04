@@ -1,36 +1,20 @@
-#include "main.h"
+#include "common.h"
 #include "fdt.h"
-#include "ff.h"
-#include "sunxi_gpio.h"
-#include "sunxi_sdhci.h"
-#include "sunxi_spi.h"
 #include "sunxi_clk.h"
-#include "sunxi_dma.h"
+#include "sunxi_wdg.h"
 #include "sdmmc.h"
 #include "arm32.h"
-#include "reg-ccu.h"
 #include "debug.h"
 #include "board.h"
 #include "barrier.h"
+#include "bootconf.h"
+#include "loaders.h"
 
 image_info_t image;
-extern u32	 _start;
-extern u32	 __spl_start;
-extern u32	 __spl_end;
-extern u32	 __spl_size;
-extern u32	 __stack_srv_start;
-extern u32	 __stack_srv_end;
-extern u32	 __stack_ddr_srv_start;
-extern u32	 __stack_ddr_srv_end;
 
-/* Linux zImage Header */
-#define LINUX_ZIMAGE_MAGIC 0x016f2818
-typedef struct {
-	unsigned int code[9];
-	unsigned int magic;
-	unsigned int start;
-	unsigned int end;
-} linux_zimage_header_t;
+static char	  cmd_line[128];
+static char	  filename[16];
+static slot_t slot;
 
 static int boot_image_setup(unsigned char *addr, unsigned int *entry)
 {
@@ -92,128 +76,90 @@ read_fail:
 open_fail:
 	return ret;
 }
-
-static int load_sdcard(image_info_t *image)
-{
-	FATFS	fs;
-	FRESULT fret;
-	int		ret;
-	u32 UNUSED_DEBUG	start;
-
-#if defined(CONFIG_SDMMC_SPEED_TEST_SIZE) && LOG_LEVEL >= LOG_DEBUG
-	u32 test_time;
-	start = time_ms();
-	sdmmc_blk_read(&card0, (u8 *)(SDRAM_BASE), 0, CONFIG_SDMMC_SPEED_TEST_SIZE);
-	test_time = time_ms() - start;
-	debug("SDMMC: speedtest %uKB in %" PRIu32 "ms at %" PRIu32 "KB/S\r\n", (CONFIG_SDMMC_SPEED_TEST_SIZE * 512) / 1024, test_time,
-		  (CONFIG_SDMMC_SPEED_TEST_SIZE * 512) / test_time);
-#endif // SDMMC_SPEED_TEST
-
-	start = time_ms();
-	/* mount fs */
-	fret = f_mount(&fs, "", 1);
-	if (fret != FR_OK) {
-		error("FATFS: mount error: %d\r\n", fret);
-		return -1;
-	} else {
-		debug("FATFS: mount OK\r\n");
-	}
-
-	info("FATFS: read %s addr=%x\r\n", image->of_filename, (unsigned int)image->of_dest);
-	ret = fatfs_loadimage(image->of_filename, image->of_dest);
-	if (ret)
-		return ret;
-
-	info("FATFS: read %s addr=%x\r\n", image->filename, (unsigned int)image->dest);
-	ret = fatfs_loadimage(image->filename, image->dest);
-	if (ret)
-		return ret;
-
-	/* umount fs */
-	fret = f_mount(0, "", 0);
-	if (fret != FR_OK) {
-		error("FATFS: unmount error %d\r\n", fret);
-		return -1;
-	} else {
-		debug("FATFS: unmount OK\r\n");
-	}
-	debug("FATFS: done in %" PRIu32 "ms\r\n", time_ms() - start);
-
-	return 0;
-}
-
-#endif
-
-#ifdef CONFIG_BOOT_SPINAND
-int load_spi_nand(sunxi_spi_t *spi, image_info_t *image)
-{
-	linux_zimage_header_t *hdr;
-	unsigned int		   size;
-	uint64_t UNUSED_DEBUG	   start, time;
-
-	if (spi_nand_detect(spi) != 0)
-		return -1;
-
-	/* get dtb size and read */
-	spi_nand_read(spi, image->of_dest, CONFIG_SPINAND_DTB_ADDR, (uint32_t)sizeof(boot_param_header_t));
-	if (of_get_magic_number(image->of_dest) != OF_DT_MAGIC) {
-		error("SPI-NAND: DTB verification failed\r\n");
-		return -1;
-	}
-
-	size = of_get_dt_total_size(image->of_dest);
-	debug("SPI-NAND: dt blob: Copy from 0x%08x to 0x%08lx size:0x%08x\r\n", CONFIG_SPINAND_DTB_ADDR,
-		  (uint32_t)image->of_dest, size);
-	start = time_us();
-	spi_nand_read(spi, image->of_dest, CONFIG_SPINAND_DTB_ADDR, (uint32_t)size);
-	time = time_us() - start;
-	info("SPI-NAND: read dt blob of size %u at %.2fMB/S\r\n", size, (f32)(size / time));
-
-	/* get kernel size and read */
-	spi_nand_read(spi, image->dest, CONFIG_SPINAND_KERNEL_ADDR, (uint32_t)sizeof(linux_zimage_header_t));
-	hdr = (linux_zimage_header_t *)image->dest;
-	if (hdr->magic != LINUX_ZIMAGE_MAGIC) {
-		debug("SPI-NAND: zImage verification failed\r\n");
-		return -1;
-	}
-	size = hdr->end - hdr->start;
-	debug("SPI-NAND: Image: Copy from 0x%08x to 0x%08lx size:0x%08x\r\n", CONFIG_SPINAND_KERNEL_ADDR,
-		  (uint32_t)image->dest, size);
-	start = time_us();
-	spi_nand_read(spi, image->dest, CONFIG_SPINAND_KERNEL_ADDR, (uint32_t)size);
-	time = time_us() - start;
-	info("SPI-NAND: read Image of size %u at %.2fMB/S\r\n", size, (f32)(size / time));
-
-	return 0;
-}
 #endif
 
 int main(void)
 {
+	unsigned int entry_point = 0;
+	uint32_t	 i;
+	uint32_t	 memory_size;
+	uint32_t	 wait	   = 0;
+	char		 slot_name = 'R';
+	uint8_t		 slot_num  = 0;
+	uint8_t		 slot_boots[3];
+	bool		 slot_valid[3];
+	char		 slots[3]	 = {'R', 'A', 'B'};
+	uint8_t		 btn_led_val = false;
 	board_init();
 	sunxi_clk_init();
 
 	message("\r\n");
 	info("AWBoot r%" PRIu32 " starting...\r\n", (u32)BUILD_REVISION);
 
-	sunxi_dram_init();
+	sunxi_wdg_set(10);
 
-	unsigned int entry_point = 0;
+	memory_size = sunxi_dram_init();
+
 	void (*kernel_entry)(int zero, int arch, unsigned int params);
 
 #ifdef CONFIG_ENABLE_CPU_FREQ_DUMP
 	sunxi_clk_dump();
 #endif
 
+	// Check if we should be running
+	if (!board_get_power_on()) {
+		info("Waiting for power off...");
+		board_set_status(0);
+		while (1) { // wait for poweroff or watchdog
+			mdelay(500);
+			message(".");
+		};
+	} else {
+		// Indicate to MCU that we are running
+		board_set_status(1);
+	}
+
+	// Wait for recovery or FEL mode
+	// After 10s, mgmt MCU will reset CPU in FEL mode so we have to wait indefinitely
+	if (board_get_button()) {
+		info("Button pressed\r\n");
+		info("Hold 3s for recovery, 10s for FEL\r\n");
+	};
+	while (board_get_button()) {
+		mdelay(245);
+		wait += 250;
+		// Blink button
+		btn_led_val = !btn_led_val;
+		board_set_led(LED_BUTTON, btn_led_val);
+		sunxi_wdg_set(3);
+		if (wait >= 3000) {
+			message("F");
+		} else {
+			message("R");
+		}
+		if (wait >= 10000) {
+			message("\r\n");
+			info("Release button to enter FEL mode\r\n");
+			board_set_led(LED_BUTTON, 0);
+			board_set_status(0);
+			sunxi_wdg_set(10);
+			while (1) {
+				mdelay(100);
+			};
+		}
+	};
+
+	// Give enough time to load files
+	sunxi_wdg_set(10);
+
 	memset(&image, 0, sizeof(image_info_t));
 
-	image.of_dest = (u8 *)CONFIG_DTB_LOAD_ADDR;
-	image.dest	  = (u8 *)CONFIG_KERNEL_LOAD_ADDR;
+	image.dtb_dest	  = (u8 *)CONFIG_DTB_LOAD_ADDR;
+	image.kernel_dest = (u8 *)CONFIG_KERNEL_LOAD_ADDR;
+	image.initrd_dest = (u8 *)CONFIG_INITRAMFS_LOAD_ADDR;
 
+// Normal media boot
 #if defined(CONFIG_BOOT_SDCARD) || defined(CONFIG_BOOT_MMC)
-
-	strcpy(image.filename, CONFIG_KERNEL_FILENAME);
-	strcpy(image.of_filename, CONFIG_DTB_FILENAME);
 
 	if (sunxi_sdhci_init(&sdhci0) != 0) {
 		fatal("SMHC: %s controller init failed\r\n", sdhci0.name);
@@ -226,23 +172,127 @@ int main(void)
 		goto _spi;
 #else
 		fatal("SMHC: init failed\r\n");
-#endif
 	}
+#endif
 
-#ifdef CONFIG_BOOT_SPINAND
-	if (load_sdcard(&image) != 0) {
-		warning("SMHC: loading failed, trying SPI\r\n");
-	} else {
-		goto _boot;
-	}
-#else
-	if (load_sdcard(&image) != 0) {
-		fatal("SMHC: card load failed\r\n");
-	} else {
-		goto _boot;
-	}
-#endif // CONFIG_SPI_NAND
+		if (mount_sdmmc() != 0) {
+			fatal("SMHC: card mount failed\r\n");
+		};
+
+		strcpy(filename + 1, ".state");
+
+		// Check both normal slots for validity
+		for (i = 1; i < sizeof(slot_boots); i++) {
+			slot_boots[i] = RTC_BKP_REG(i);
+			filename[0]	  = slots[i];
+
+			if (slot_boots[i] > CONFIG_BOOT_MAX_TRIES) {
+				slot_valid[i] = false;
+			} else {
+				if (bootconf_is_slot_state_good(filename)) {
+					slot_valid[i] = true;
+				} else {
+					slot_valid[i] = false;
+				}
+			}
+		}
+
+		if (wait >= 3000) {
+			info("BOOT: forced recovery boot\r\n");
+			slot_name = 'R';
+		} else {
+			slot_name = bootconf_get_slot(CONFIG_CONF_FILENAME);
+		}
+
+		// Convert to num for backup registers
+		switch (slot_name) {
+			case 'A':
+				slot_num = 1;
+				break;
+			case 'B':
+				slot_num = 2;
+				break;
+			case 'R':
+			default:
+				slot_name = 'R';
+				slot_num  = 0;
+		}
+
+		info("BOOT: selected slot [%c]\r\n", slot_name);
+
+		if (!slot_valid[slot_num] && slot_name != 'R') {
+			// Selected slot is A, slot B is valid
+			if (slot_name == 'A' && slot_valid[2]) {
+				slot_num  = 2;
+				slot_name = 'B';
+			}
+			// Selected slot is B, slot A is valid
+			else if (slot_name == 'B' && slot_valid[1]) {
+				slot_num  = 1;
+				slot_name = 'A';
+			} else {
+				// Recovery slot in last resort
+				slot_num  = 0;
+				slot_name = 'R';
+			}
+			warning("BOOT: fallback to slot [%c] after %u failures\r\n", slot_name, slot_boots[slot_num]);
+		} else {
+			info("BOOT: standard boot on slot [%c]\r\n", slot_name);
+		}
+
+		filename[0] = slot_name;
+		strcpy(filename + 1, ".cfg");
+
+		if (bootconf_load_slot_data(filename, &slot) != 0) {
+			if (slot_name != 'R') {
+				error("BOOT: failed to load main slot config\r\n");
+				if (slot_name == 'A' && slot_valid[2]) { // try B
+					filename[0] = 'B';
+					error("BOOT: failed to load slot %c config, fallback to slot %c\r\n", slot_name, filename[0]);
+					if (bootconf_load_slot_data(filename, &slot) != 0) {
+						error("BOOT: failed to load slot %c config, fallback to slot %c\r\n", filename[0], 'R');
+						if (bootconf_load_slot_data("R.cfg", &slot) != 0) {
+							fatal("BOOT: failed to load recovery slot config\r\n");
+						}
+					}
+				} else if (slot_name == 'B' && slot_valid[1]) { // try A
+					filename[0] = 'A';
+					error("BOOT: failed to load slot %c config, fallback to slot %c\r\n", slot_name, filename[0]);
+					if (bootconf_load_slot_data(filename, &slot) != 0) {
+						error("BOOT: failed to load slot %c config, fallback to slot %c\r\n", filename[0], 'R');
+						if (bootconf_load_slot_data("R.cfg", &slot) != 0) {
+							fatal("BOOT: failed to load recovery slot config\r\n");
+						}
+					}
+				} else if (bootconf_load_slot_data("R.cfg", &slot) != 0) {
+					fatal("BOOT: failed to load recovery slot config\r\n");
+				}
+			} else {
+				fatal("BOOT: failed to load recovery slot config\r\n");
+			}
+		}
+
+		image.initrd_size = 0; // Set by load_sdmmc()
+
+		strcpy(cmd_line, slot.kernel_cmd);
+		image.filename		  = slot.kernel_filename;
+		image.dtb_filename	  = slot.dtb_filename;
+		image.initrd_filename = slot.initrd_filename;
+
+#elif defined(CONFIG_BOOT_SPINAND)
+	// Static slot configs for SPI
+	image.initrd_size = 0; // disabled
+	strcpy(cmd_line, CONFIG_DEFAULT_BOOT_CMD);
+
+#else // 100% Fel boot
+	info("BOOT: FEL mode\r\n");
+
+	// This value is copied via xfel
+	image.initrd_size = *(uint32_t *)(0x45000000);
+
+	strcpy(cmd_line, CONFIG_DEFAULT_BOOT_CMD);
 #endif
+
 
 #ifdef CONFIG_BOOT_SPINAND
 #if defined(CONFIG_BOOT_SDCARD) || defined(CONFIG_BOOT_MMC)
@@ -255,31 +305,70 @@ _spi:
 		fatal("SPI: init failed\r\n");
 	}
 
-	if (load_spi_nand(&sunxi_spi0, &image) != 0) {
-		fatal("SPI-NAND: loading failed\r\n");
-	}
+		if (load_spi_nand(&sunxi_spi0, &image) != 0) {
+			fatal("SPI-NAND: loading failed\r\n");
+		}
 
 	sunxi_spi_disable(&sunxi_spi0);
 	dma_exit();
 
 #endif // CONFIG_SPI_NAND
 
-#if defined(CONFIG_BOOT_SDCARD) || defined(CONFIG_BOOT_MMC)
-_boot:
-#endif
-	if (boot_image_setup((unsigned char *)image.dest, &entry_point)) {
+	if (boot_image_setup((unsigned char *)image.kernel_dest, &entry_point)) {
 		fatal("boot setup failed\r\n");
+		sunxi_spi_disable(&sunxi_spi0);
+
+		// The kernel will reset WDG
+		sunxi_wdg_set(3);
+
+		// Check if we should still be running
+		if (!board_get_power_on()) {
+			info("Waiting for power off...");
+			board_set_status(0);
+			while (1) { // wait for poweroff or watchdog
+			};
+		}
 	}
 
-	info("booting linux...\r\n");
+		if (strlen(cmd_line) > 0) {
+			debug("BOOT: args %s\r\n", cmd_line);
+			if (fdt_update_bootargs(image.dtb_dest, cmd_line)) {
+				error("BOOT: Failed to set boot args\r\n");
+			}
+		}
 
-	arm32_mmu_disable();
-	arm32_dcache_disable();
-	arm32_icache_disable();
-	arm32_interrupt_disable();
+		if (fdt_update_memory(image.dtb_dest, SDRAM_BASE, memory_size)) {
+			error("BOOT: Failed to set memory size\r\n");
+		} else {
+			debug("BOOT: Set memory size to 0x%x\r\n", memory_size);
+		}
 
-	kernel_entry = (void (*)(int, int, unsigned int))entry_point;
-	kernel_entry(0, ~0, (unsigned int)image.of_dest);
+		if (image.initrd_dest) {
+			if (fdt_update_initrd(image.dtb_dest, (uint32_t)image.initrd_dest,
+								  (uint32_t)(image.initrd_dest + image.initrd_size))) {
+				error("BOOT: Failed to set initrd address\r\n");
+			} else {
+				debug("BOOT: Set initrd to 0x%x-0x%x\r\n", image.initrd_dest, image.initrd_dest + image.initrd_size);
+			}
+		}
 
-	return 0;
-}
+#if defined(CONFIG_BOOT_SDCARD) || defined(CONFIG_BOOT_MMC)
+		// Increase boot count for this slot
+		// It will be set to zero from Linux once boot is validated
+		RTC_BKP_REG(slot_num) += 1;
+#endif
+
+		info("booting linux...\r\n");
+		board_set_led(LED_BOARD, 0);
+		board_set_led(LED_BUTTON, 1);
+
+		arm32_mmu_disable();
+		arm32_dcache_disable();
+		arm32_icache_disable();
+		arm32_interrupt_disable();
+
+		kernel_entry = (void (*)(int, int, unsigned int))entry_point;
+		kernel_entry(0, ~0, (unsigned int)image.dtb_dest);
+
+		return 0;
+	}
